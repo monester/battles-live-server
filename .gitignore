@@ -1,0 +1,7 @@
+venv
+*.pyc
+db.sqlite
+.cache
+.idea
+dumps/
+*.json
