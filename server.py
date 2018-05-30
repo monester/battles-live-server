@@ -8,7 +8,7 @@ import pytz
 
 from aiohttp import web
 import json
-from db import db, orm, Clan, Province
+from db import db, orm, Clan, Province, Front
 
 from timeit import timeit
 
@@ -83,6 +83,18 @@ async def get_papi_clan_provinces(region, clan_id):
             return data
 
 
+@timeit
+async def get_papi_fronts(region):
+    params = {
+        'application_id': WARGAMING_API,
+    }
+    url = get_papi_url(region, 'wot/globalmap/fronts')
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            data = await resp.json()
+            return data
+
+
 async def get_tournament_info(region, province_id):
     url = f'https://{region}.wargaming.net/globalmap/game_api/tournament_info?alias={province_id}'
     async with aiohttp.ClientSession() as session:
@@ -117,15 +129,27 @@ async def get_clan_provinces(region, clan):
     log.debug('Got %s provinces for %s: %s', len(provinces), clan.tag, provinces)
     return provinces
 
-    # async with aiohttp.ClientSession() as session:
-    #     async with session.get(url) as resp:
-    #         await asyncio.gather(*[for p in data])
+
+@timeit
+async def get_front_name(region, front_id, fronts):
+    print(fronts)
+    if front_id not in fronts:
+        with orm.db_session:
+            for front in (await get_papi_fronts(region))['data']:
+                if front['front_id'] not in fronts:
+                    Front(front_id=front['front_id'], front_name=front['front_name'])
+                    fronts[front['front_id']] = front['front_name']
+
+    return fronts[front_id]
 
 
 @timeit
 async def get_clan_battles(region, provinces, clan):
     tournaments = await asyncio.gather(*[get_tournament_info(region, p) for p in provinces])
     all_battles = []
+
+    with orm.db_session:
+        fronts = {f.front_id: f.front_name for f in orm.select(f for f in Front)}
 
     now = datetime.now(tz=pytz.UTC).replace(microsecond=0)
     for tournament in tournaments:
@@ -147,7 +171,8 @@ async def get_clan_battles(region, provinces, clan):
         if owner:
             clans[owner] = tournament['owner']
 
-        if start_time.hour > now.hour and battles:
+        # now + timedelta(hours=1) because battles are formed 1 hour before starting battles
+        if start_time.hour > (now + timedelta(hours=1)).hour and battles:
             start_time -= timedelta(days=1)
         elif start_time.hour <= now.hour and not battles:
             start_time += timedelta(days=1)
@@ -185,7 +210,7 @@ async def get_clan_battles(region, provinces, clan):
 
         # special case
         owner_battle = {
-            'title': 'owner',
+            'title': 'Owner',
             'time': int((start_time + timedelta(minutes=30) * len(times)).timestamp() * 1000),
             'duration': 1800000,
             'clan_a': tournament['owner'],
@@ -206,12 +231,14 @@ async def get_clan_battles(region, provinces, clan):
                 })
 
         if times:
+            times = times[round_number - 1:]
             if owner == clan.tag:
                 times = [owner_battle]
 
             all_battles.append({
                 'id': tournament['province_id'],
                 'region': region,
+                'front_name': await get_front_name(region, tournament['front_id'], fronts),
                 'province_name': tournament['province_name'],
                 'arena_name': tournament['arena_name'],
                 'start_time': int(start_time.timestamp() * 1000),
@@ -219,7 +246,7 @@ async def get_clan_battles(region, provinces, clan):
                 'times': times
             })
 
-    all_battles.sort(key=lambda x: x['start_time'])
+    all_battles.sort(key=lambda x: (x['times'][0]['time'], x['start_time'], x['id']))
 
     return all_battles
 

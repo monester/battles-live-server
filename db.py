@@ -8,6 +8,12 @@ class Clan(db.Entity):
     tag = orm.Required(str)
     region = orm.Required(str)
 
+
+class Front(db.Entity):
+    front_id = orm.Required(str)
+    front_name = orm.Required(str)
+
+
 class Province(db.Entity):
     region = orm.Required(str)
     province = orm.Required(str)
