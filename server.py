@@ -1,3 +1,4 @@
+from itertools import chain
 import math
 import logging
 import os
@@ -8,7 +9,8 @@ import pytz
 
 from aiohttp import web
 import json
-from db import db, orm, Clan, Province, Front
+from pony import orm
+from db import Clan, Province, Front, ProvinceTag
 
 from timeit import timeit
 
@@ -38,7 +40,7 @@ async def get_clan_info(region, tag):
     tag = tag.upper()
 
     with orm.db_session:
-        clans = orm.select(p for p in Clan if p.tag == tag and p.region == region)[:]
+        clans = orm.select(p for p in Clan if p.clan_tag == tag and p.region == region)[:]
     if len(clans):
         return clans[0]
 
@@ -50,11 +52,10 @@ async def get_clan_info(region, tag):
         url = get_papi_url(region, 'wgn/clans/list')
         async with session.get(url, params=params) as resp:
             data = await resp.json()
-            print(data)
             for clan in data['data']:
                 if clan['tag'] == tag:
                     with orm.db_session:
-                        clan = Clan(clan_id=str(clan['clan_id']), tag=clan['tag'], region=region)
+                        clan = Clan(clan_id=str(clan['clan_id']), clan_tag=clan['tag'], region=region)
                     return clan
             return None
 
@@ -94,6 +95,25 @@ async def get_papi_fronts(region):
             data = await resp.json()
             return data
 
+@timeit
+async def get_papi_provinces(region, front_id, provinces):
+    params = {
+        'application_id': WARGAMING_API,
+        'front_id': front_id,
+        'province_id': ','.join(provinces),
+        'fields': ','.join([
+            'province_id',
+            'province_name',
+            'server',
+            'front_id',
+        ])
+    }
+    url = get_papi_url(region, 'wot/globalmap/provinces')
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            data = await resp.json()
+            return data['data']
+
 
 async def get_tournament_info(region, province_id):
     url = f'https://{region}.wargaming.net/globalmap/game_api/tournament_info?alias={province_id}'
@@ -115,24 +135,30 @@ async def get_clan_provinces(region, clan):
     clan_provinces = provinces[1]['data'][str(clan.clan_id)]
 
     provinces = []
+    front_provinces = {}
     for i in clan_provinces or []:
         provinces.append(i['province_id'])
+        front_provinces.setdefault(i['front_id'], []).append(i['province_id'])
 
     for i in clan_battles['planned_battles']:
         provinces.append(i['province_id'])
+        front_provinces.setdefault(i['front_id'], []).append(i['province_id'])
 
     for i in clan_battles['battles']:
         provinces.append(i['province_id'])
+        front_provinces.setdefault(i['front_id'], []).append(i['province_id'])
 
+    # making list unique
     provinces = list(set(provinces))
+    for k, v in front_provinces.items():
+        front_provinces[k] = list(set(v))
 
-    log.debug('Got %s provinces for %s: %s', len(provinces), clan.tag, provinces)
-    return provinces
+    log.debug('Got %s provinces for %s: %s', len(provinces), clan.clan_tag, provinces)
+    return provinces, front_provinces
 
 
 @timeit
 async def get_front_name(region, front_id, fronts):
-    print(fronts)
     if front_id not in fronts:
         with orm.db_session:
             for front in (await get_papi_fronts(region))['data']:
@@ -222,9 +248,9 @@ async def get_clan_battles(region, provinces, clan):
 
         for i in battles:
             if i['is_fake']:
-                if i['first_competitor']['tag'] == clan.tag:
+                if i['first_competitor']['tag'] == clan.clan_tag:
                     times[round_number - 1]['is_fake'] = True
-            elif i['first_competitor']['tag'] == clan.tag or i['second_competitor']['tag'] == clan.tag:
+            elif i['first_competitor']['tag'] == clan.clan_tag or i['second_competitor']['tag'] == clan.clan_tag:
                 times[round_number - 1].update({
                     'clan_a': i['first_competitor'],
                     'clan_b': i['second_competitor'],
@@ -232,7 +258,7 @@ async def get_clan_battles(region, provinces, clan):
 
         if times:
             times = times[round_number - 1:]
-            if owner == clan.tag:
+            if owner == clan.clan_tag:
                 times = [owner_battle]
 
             all_battles.append({
@@ -251,6 +277,38 @@ async def get_clan_battles(region, provinces, clan):
     return all_battles
 
 
+async def get_provinces_data(region, front_provinces):
+    all_provinces = list(chain(*map(lambda x: x, front_provinces.values())))
+
+    with orm.db_session:
+        provinces_data = {
+            p.province_id: p
+            for p in orm.select(p for p in Province if p.province_id in all_provinces)
+        }
+
+    missing_task = []
+    missing = {}
+
+    for front_id, provinces in front_provinces.items():
+        for province_id in provinces:
+            if province_id not in provinces_data:
+                missing.setdefault(front_id, []).append(province_id)
+
+    for front_id, provinces in missing.items():
+        missing_task.append(get_papi_provinces(region, front_id, provinces))
+
+    for p in chain(*await asyncio.gather(*missing_task)):
+        with orm.db_session:
+            provinces_data[p['province_id']] = Province(
+                region=region,
+                province_name=p['province_name'],
+                front_id=p['front_id'],
+                province_id=p['province_id'],
+                server=p['server'],
+            )
+
+    return provinces_data
+
 async def list_battles(request):
     region = request.match_info.get('region')
     tag = request.match_info.get('tag')
@@ -259,18 +317,19 @@ async def list_battles(request):
     data = {}
 
     if clan:
-        provinces = await get_clan_provinces(region, clan)
-        battles = await get_clan_battles(region, provinces, clan)
+        all_provinces, front_provinces = await get_clan_provinces(region, clan)
+        provinces = await get_provinces_data(region, front_provinces)
+        battles = await get_clan_battles(region, all_provinces, clan)
 
         with orm.db_session:
             for battle in battles:
-                province = battle['id']
-                p = orm.select(p for p in Province if p.province == province and p.region == region)[:1]
-                if p:
-                    battle['tags'] = json.loads(p[0].tags)['tags']
+                province = provinces[battle['id']]
+                battle['server'] = province.server
+                tags = ProvinceTag.select(lambda tags: tags.province == province and tags.clan == clan)[:1]
+                if tags:
+                    battle['tags'] = json.loads(tags[0].tags)['tags']
                 else:
                     battle['tags'] = []
-
 
         data = {'tag': tag, 'clan_id': clan.clan_id, 'items': battles}
         # print(json.dumps(battles, indent=4))
@@ -283,17 +342,25 @@ async def list_battles(request):
 
 async def set_tags(request):
     region = request.match_info.get('region')
-    province_id = request.match_info.get('province')
+    clan_id = int(request.match_info.get('clan_id'))
+    province_id = request.match_info.get('province_id')
     data = json.loads(await request.text())
 
     with orm.db_session:
-        provinces = orm.select(p for p in Province if p.province == province_id and p.region == region)[:1]
+        provinces = Province.select(lambda p: p.province_id == province_id and p.region == region)[:1]
         province = provinces[0] if len(provinces) else None
 
-        if province:
-            province.tags = json.dumps(data)
-        else:
-            Province(region=region, province=province_id, tags=json.dumps(data))
+        clans = Clan.select(lambda c: c.clan_id == clan_id)[:1]
+        clan = clans[0] if len(clans) else None
+
+
+        if province and clan:
+            print(data)
+            tags = ProvinceTag.select(lambda tags: tags.province == province and tags.clan == clan)[:1]
+            if tags:
+                tags[0].tags = json.dumps(data)
+            else:
+                ProvinceTag(province=province, clan=clan, tags=json.dumps(data))
 
     return web.Response(
         text=json.dumps(data, indent=4),
@@ -303,7 +370,7 @@ async def set_tags(request):
 
 def main():
     app = web.Application()
-    app.router.add_post('/tags/{region}/{province}', set_tags)
+    app.router.add_post('/tags/{region}/{clan_id}/{province_id}', set_tags)
     app.router.add_get('/{region}/{tag}', list_battles)
     web.run_app(app)
 
