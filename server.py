@@ -284,6 +284,7 @@ async def get_clan_battles(region, provinces, clan):
             if times[0]['winner_id']:
                 times = times[1:]
 
+        if times:
             if owner == clan.clan_tag:
                 times = [owner_battle]
 
