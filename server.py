@@ -101,12 +101,7 @@ async def get_papi_provinces(region, front_id, provinces):
         'application_id': WARGAMING_API,
         'front_id': front_id,
         'province_id': ','.join(provinces),
-        'fields': ','.join([
-            'province_id',
-            'province_name',
-            'server',
-            'front_id',
-        ])
+        'fields': ','.join(['province_id', 'province_name', 'server', 'front_id'])
     }
     url = get_papi_url(region, 'wot/globalmap/provinces')
     async with aiohttp.ClientSession() as session:
@@ -157,7 +152,6 @@ async def get_clan_provinces(region, clan):
     return provinces, front_provinces
 
 
-@timeit
 async def get_front_name(region, front_id, fronts):
     if front_id not in fronts:
         with orm.db_session:
@@ -183,6 +177,7 @@ async def get_clan_battles(region, provinces, clan):
         start_time = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
         battles = tournament['battles']
         round_number = tournament['round_number']
+        next_round = tournament['next_round']
         owner = tournament['owner'] and tournament['owner']['tag']
 
         clans = {i['tag']: i for i in tournament['pretenders'] or []}
@@ -207,14 +202,28 @@ async def get_clan_battles(region, provinces, clan):
 
         rounds = round_number - 1
 
+        next_round_pretenders = []
+
         if tournament['pretenders']:
             pretenders = [i['tag'] for i in tournament['pretenders']]
-        elif tournament['battles']:
+            next_round_pretenders = tournament['pretenders']
+        elif battles:
             pretenders = []
-            for i in tournament['battles']:
-                pretenders.append(i['first_competitor']['tag'])
-                if i['second_competitor']:
-                    pretenders.append(i['second_competitor']['tag'])
+            for battle in battles:
+                first_competitor = battle['first_competitor']
+                second_competitor = battle['second_competitor']
+                pretenders.append(first_competitor['tag'])
+
+                if battle['is_fake']:
+                    next_round_pretenders.append(first_competitor)
+                else:
+                    pretenders.append(battle['second_competitor']['tag'])
+
+                    winner_id = battle['winner_id']
+                    if winner_id:
+                        next_round_pretenders.append(
+                            first_competitor if winner_id == first_competitor['id'] else second_competitor
+                        )
         else:
             pretenders = []
 
@@ -232,7 +241,10 @@ async def get_clan_battles(region, provinces, clan):
             'duration': 1800000,
             'clan_a': None,
             'clan_b': None,
+            'pretenders': next_round_pretenders if i + 1 == next_round and next_round_pretenders else None
         } for i in range(rounds)]
+
+        next_round_pretenders.sort(key=lambda x: x['elo_rating_10'])
 
         # special case
         owner_battle = {
@@ -246,18 +258,22 @@ async def get_clan_battles(region, provinces, clan):
         if owner and pretenders:
             times.append(owner_battle)
 
-        for i in battles:
-            if i['is_fake']:
-                if i['first_competitor']['tag'] == clan.clan_tag:
+        for battle in battles:
+            first_competitor = battle['first_competitor']
+            second_competitor = battle['second_competitor']
+
+            if battle['is_fake']:
+                if first_competitor['tag'] == clan.clan_tag:
                     times[round_number - 1]['is_fake'] = True
-            elif i['first_competitor']['tag'] == clan.clan_tag or i['second_competitor']['tag'] == clan.clan_tag:
+            elif first_competitor['tag'] == clan.clan_tag or second_competitor['tag'] == clan.clan_tag:
                 times[round_number - 1].update({
-                    'clan_a': i['first_competitor'],
-                    'clan_b': i['second_competitor'],
+                    'clan_a': battle['first_competitor'],
+                    'clan_b': battle['second_competitor'],
                 })
 
         if times:
             times = times[round_number - 1:]
+
             if owner == clan.clan_tag:
                 times = [owner_battle]
 
@@ -269,7 +285,8 @@ async def get_clan_battles(region, provinces, clan):
                 'arena_name': tournament['arena_name'],
                 'start_time': int(start_time.timestamp() * 1000),
                 'prime_time': str(start_time.time()),
-                'times': times
+                'times': times,
+                'pretenders': pretenders,
             })
 
     all_battles.sort(key=lambda x: (x['times'][0]['time'], x['start_time'], x['id']))
