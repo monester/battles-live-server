@@ -180,6 +180,10 @@ async def get_clan_battles(region, provinces, clan):
         next_round = tournament['next_round']
         owner = tournament['owner'] and tournament['owner']['tag']
 
+        # remove lost province from battles
+        if len(battles) == 1 and owner == battles[0]['first_competitor']['tag'] and battles[0]['winner_id']:
+            continue
+
         clans = {i['tag']: i for i in tournament['pretenders'] or []}
         clans.update({
             i['first_competitor']['tag']: i['first_competitor']
@@ -264,14 +268,16 @@ async def get_clan_battles(region, provinces, clan):
             first_competitor = battle['first_competitor']
             second_competitor = battle['second_competitor']
 
+            province_round = times[round_number - 1]
+
             if battle['is_fake']:
                 if first_competitor['tag'] == clan.clan_tag:
-                    times[round_number - 1].update({
+                    province_round.update({
                         'is_fake': True,
                         'winner_id': battle['winner_id'],
                     })
             elif first_competitor['tag'] == clan.clan_tag or second_competitor['tag'] == clan.clan_tag:
-                times[round_number - 1].update({
+                province_round.update({
                     'winner_id': battle['winner_id'],
                     'clan_a': battle['first_competitor'],
                     'clan_b': battle['second_competitor'],
