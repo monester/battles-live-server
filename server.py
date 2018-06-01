@@ -277,10 +277,12 @@ async def get_clan_battles(region, provinces, clan):
                     'clan_b': battle['second_competitor'],
                 })
 
+        # filter out already passed rounds
         if times:
+            # remove rounds before current round
             times = times[round_number - 1:]
 
-            # if winner already determined for this round -> remove this battle from planned
+            # if winner already determined for current round
             if times[0]['winner_id']:
                 times = times[1:]
 
@@ -383,7 +385,6 @@ async def set_tags(request):
 
 
         if province and clan:
-            print(data)
             tags = ProvinceTag.select(lambda tags: tags.province == province and tags.clan == clan)[:1]
             if tags:
                 tags[0].tags = json.dumps(data)
