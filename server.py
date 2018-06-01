@@ -235,6 +235,7 @@ async def get_clan_battles(region, provinces, clan):
             rounds -= 1
 
         times = [{
+            'winner_id': None,
             'is_fake': False,
             'title': 'Final' if (i + 1 == rounds) else f'1/{pow(2, rounds-i-1)}',
             'time': int((start_time + timedelta(minutes=30)*i).timestamp() * 1000),
@@ -248,6 +249,7 @@ async def get_clan_battles(region, provinces, clan):
 
         # special case
         owner_battle = {
+            'winner_id': None,
             'title': 'Owner',
             'time': int((start_time + timedelta(minutes=30) * len(times)).timestamp() * 1000),
             'duration': 1800000,
@@ -264,15 +266,23 @@ async def get_clan_battles(region, provinces, clan):
 
             if battle['is_fake']:
                 if first_competitor['tag'] == clan.clan_tag:
-                    times[round_number - 1]['is_fake'] = True
+                    times[round_number - 1].update({
+                        'is_fake': True,
+                        'winner_id': battle['winner_id'],
+                    })
             elif first_competitor['tag'] == clan.clan_tag or second_competitor['tag'] == clan.clan_tag:
                 times[round_number - 1].update({
+                    'winner_id': battle['winner_id'],
                     'clan_a': battle['first_competitor'],
                     'clan_b': battle['second_competitor'],
                 })
 
         if times:
             times = times[round_number - 1:]
+
+            # if winner already determined for this round -> remove this battle from planned
+            if times[0]['winner_id']:
+                times = times[1:]
 
             if owner == clan.clan_tag:
                 times = [owner_battle]
