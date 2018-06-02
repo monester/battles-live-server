@@ -112,12 +112,20 @@ async def get_papi_provinces(region, front_id, provinces):
             return data['data']
 
 
-async def get_tournament_info(region, province_id):
-    url = f'https://{region}.wargaming.net/globalmap/game_api/tournament_info?alias={province_id}'
+async def get_tournament_info(region, province_id, round_number=None):
+    url = f'https://{region}.wargaming.net/globalmap/game_api/tournament_info?'
+    params = {
+        'alias': province_id
+    }
+    if round_number:
+        params['round'] = round_number
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+        async with session.get(url, params=params) as resp:
             data = await resp.json()
-            open(f'dumps/tournament_info_{province_id}.json', 'w').write(json.dumps(data, indent=4))
+            data_round_number = data.get('round_number', 'ERR')
+            filename = f'dumps/tournament_info_{province_id}_round_{data_round_number}.json'
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(data, indent=4))
             return data
 
 
@@ -167,6 +175,7 @@ async def get_front_name(region, front_id, fronts):
 
 async def parse_tournament(region, tournament, clan, fronts):
     now = datetime.now(tz=pytz.UTC).replace(microsecond=0)
+    province_id = tournament['province_id']
     start = [int(i) for i in tournament['start_time'].split(':')]
     start_time = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
     battles = tournament['battles']
@@ -289,6 +298,14 @@ async def parse_tournament(region, tournament, clan, fronts):
     if times:
         if owner == clan.clan_tag:
             times = [owner_battle]
+        elif round_number == 1 and not battles:
+            times[0]['pretenders'] = tournament['pretenders']
+        else:
+            if next_round_pretenders:
+                while next_round_pretenders:
+                    next_round_pretenders.pop()
+                next_battle = await get_tournament_info(region, province_id, next_round)
+                next_round_pretenders.extend(next_battle['pretenders'])
 
         return {
             'id': tournament['province_id'],
@@ -311,12 +328,10 @@ async def get_clan_battles(region, provinces, clan):
     with orm.db_session:
         fronts = {f.front_id: f.front_name for f in orm.select(f for f in Front)}
 
-    for tournament in tournaments:
+    async def get_tournament_task(tournament):
         try:
             data = await parse_tournament(region=region, tournament=tournament, clan=clan, fronts=fronts)
-            if data:
-                data['region'] = region
-                all_battles.append(data)
+            return [data] if data else []
         except:
             now = datetime.now().isoformat()
             province_id = tournament.get('province_id', 'NO-PROVINCE-ID')
@@ -326,12 +341,15 @@ async def get_clan_battles(region, provinces, clan):
             with open(f'{filename}.traceback', 'w', encoding='utf-8') as f:
                 f.write(traceback.format_exc())
             log.error("Unable to parse province: '%s'", province_id)
+        return []
+
+    all_battles = list(chain(*await asyncio.gather(*[get_tournament_task(i) for i in tournaments])))
 
     try:
         all_battles.sort(key=lambda x: (x['times'][0]['time'], x['start_time'], x['id']))
     except:
         now = datetime.now().isoformat()
-        filename = f'errors/province/{now}_{province_id}_sort_all_battles'
+        filename = f'errors/province/{now}_sort_all_battles'
         with open(f'{filename}.json', 'w', encoding='utf-8') as f:
             f.write(json.dumps(all_battles, indent=4))
         with open(f'{filename}.traceback', 'w', encoding='utf-8') as f:
