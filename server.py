@@ -1,3 +1,4 @@
+import traceback
 from itertools import chain
 import math
 import logging
@@ -95,6 +96,7 @@ async def get_papi_fronts(region):
             data = await resp.json()
             return data
 
+
 @timeit
 async def get_papi_provinces(region, front_id, provinces):
     params = {
@@ -163,6 +165,144 @@ async def get_front_name(region, front_id, fronts):
     return fronts[front_id]
 
 
+async def parse_tournament(region, tournament, clan, fronts):
+    now = datetime.now(tz=pytz.UTC).replace(microsecond=0)
+    start = [int(i) for i in tournament['start_time'].split(':')]
+    start_time = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
+    battles = tournament['battles']
+    round_number = tournament['round_number']
+    next_round = tournament['next_round']
+    owner = tournament['owner'] and tournament['owner']['tag']
+
+    # ignore tournament if last round list already finished
+    if len(battles) == 1 and owner == battles[0]['first_competitor']['tag'] and battles[0]['winner_id']:
+        return
+
+    clans = {i['tag']: i for i in tournament['pretenders'] or []}
+    clans.update({
+        i['first_competitor']['tag']: i['first_competitor']
+        for i in tournament['battles']
+    })
+    clans.update({
+        i['second_competitor']['tag']: i['second_competitor']
+        for i in tournament['battles'] if i['second_competitor']
+    })
+    if owner:
+        clans[owner] = tournament['owner']
+
+    # now + timedelta(hours=1) because battles are formed 1 hour before starting battles
+    if start_time.hour > (now + timedelta(hours=1)).hour and battles:
+        start_time -= timedelta(days=1)
+    elif start_time.hour <= now.hour and not battles:
+        start_time += timedelta(days=1)
+
+    # print('>> %-13s (%2d) %s %s' % (tournament['province_id'], len(battles), start_time, now))
+
+    rounds = round_number - 1
+
+    next_round_pretenders = []
+
+    if tournament['pretenders']:
+        pretenders = [i['tag'] for i in tournament['pretenders']]
+        next_round_pretenders = tournament['pretenders']
+    elif battles:
+        pretenders = []
+        for battle in battles:
+            first_competitor = battle['first_competitor']
+            second_competitor = battle['second_competitor']
+            pretenders.append(first_competitor['tag'])
+
+            if battle['is_fake']:
+                next_round_pretenders.append(first_competitor)
+            else:
+                pretenders.append(battle['second_competitor']['tag'])
+
+                winner_id = battle['winner_id']
+                if winner_id:
+                    next_round_pretenders.append(
+                        first_competitor if winner_id == first_competitor['id'] else second_competitor
+                    )
+    else:
+        pretenders = []
+
+    log.debug('%-20s | owner : %5s | pretenders : %s', tournament['province_id'], owner, pretenders)
+    if pretenders:
+        rounds += math.ceil(math.log2(len(pretenders)))
+
+    if owner in pretenders:
+        rounds -= 1
+
+    times = [{
+        'winner_id': None,
+        'is_fake': False,
+        'title': 'Final' if (i + 1 == rounds) else f'1/{pow(2, rounds-i-1)}',
+        'time': int((start_time + timedelta(minutes=30) * i).timestamp() * 1000),
+        'duration': 1800000,
+        'clan_a': None,
+        'clan_b': None,
+        'pretenders': next_round_pretenders if i + 1 == next_round and next_round_pretenders else None
+    } for i in range(rounds)]
+
+    next_round_pretenders.sort(key=lambda x: x['elo_rating_10'])
+
+    # special case
+    owner_battle = {
+        'winner_id': None,
+        'title': 'Owner',
+        'time': int((start_time + timedelta(minutes=30) * len(times)).timestamp() * 1000),
+        'duration': 1800000,
+        'clan_a': tournament['owner'],
+        'clan_b': None,
+    }
+
+    if owner and pretenders:
+        times.append(owner_battle)
+
+    for battle in battles:
+        first_competitor = battle['first_competitor']
+        second_competitor = battle['second_competitor']
+
+        province_round = times[round_number - 1]
+
+        if battle['is_fake']:
+            if first_competitor['tag'] == clan.clan_tag:
+                province_round.update({
+                    'is_fake': True,
+                    'winner_id': battle['winner_id'],
+                })
+        elif first_competitor['tag'] == clan.clan_tag or second_competitor['tag'] == clan.clan_tag:
+            province_round.update({
+                'winner_id': battle['winner_id'],
+                'clan_a': battle['first_competitor'],
+                'clan_b': battle['second_competitor'],
+            })
+
+    # filter out already passed rounds
+    if times:
+        # remove rounds before current round
+        times = times[round_number - 1:]
+
+        # if winner already determined for current round
+        if times[0]['winner_id']:
+            times = times[1:]
+
+    if times:
+        if owner == clan.clan_tag:
+            times = [owner_battle]
+
+        return {
+            'id': tournament['province_id'],
+            'region': region,
+            'front_name': await get_front_name(region, tournament['front_id'], fronts),
+            'province_name': tournament['province_name'],
+            'arena_name': tournament['arena_name'],
+            'start_time': int(start_time.timestamp() * 1000),
+            'prime_time': str(start_time.time()),
+            'times': times,
+            'pretenders': pretenders,
+        }
+
+
 @timeit
 async def get_clan_battles(region, provinces, clan):
     tournaments = await asyncio.gather(*[get_tournament_info(region, p) for p in provinces])
@@ -171,144 +311,32 @@ async def get_clan_battles(region, provinces, clan):
     with orm.db_session:
         fronts = {f.front_id: f.front_name for f in orm.select(f for f in Front)}
 
-    now = datetime.now(tz=pytz.UTC).replace(microsecond=0)
     for tournament in tournaments:
-        start = [int(i) for i in tournament['start_time'].split(':')]
-        start_time = now.replace(hour=start[0], minute=start[1], second=0, microsecond=0)
-        battles = tournament['battles']
-        round_number = tournament['round_number']
-        next_round = tournament['next_round']
-        owner = tournament['owner'] and tournament['owner']['tag']
+        try:
+            data = await parse_tournament(region=region, tournament=tournament, clan=clan, fronts=fronts)
+            if data:
+                data['region'] = region
+                all_battles.append(data)
+        except:
+            now = datetime.now().isoformat()
+            province_id = tournament.get('province_id', 'NO-PROVINCE-ID')
+            filename = f'errors/province/{now}_{province_id}'
+            with open(f'{filename}.json', 'w', encoding='utf-8') as f:
+                f.write(json.dumps(tournament, indent=4))
+            with open(f'{filename}.traceback', 'w', encoding='utf-8') as f:
+                f.write(traceback.format_exc())
+            log.error("Unable to parse province: '%s'", province_id)
 
-        # remove lost province from battles
-        if len(battles) == 1 and owner == battles[0]['first_competitor']['tag'] and battles[0]['winner_id']:
-            continue
-
-        clans = {i['tag']: i for i in tournament['pretenders'] or []}
-        clans.update({
-            i['first_competitor']['tag']: i['first_competitor']
-            for i in tournament['battles']
-        })
-        clans.update({
-            i['second_competitor']['tag']: i['second_competitor']
-            for i in tournament['battles'] if i['second_competitor']
-        })
-        if owner:
-            clans[owner] = tournament['owner']
-
-        # now + timedelta(hours=1) because battles are formed 1 hour before starting battles
-        if start_time.hour > (now + timedelta(hours=1)).hour and battles:
-            start_time -= timedelta(days=1)
-        elif start_time.hour <= now.hour and not battles:
-            start_time += timedelta(days=1)
-
-        # print('>> %-13s (%2d) %s %s' % (tournament['province_id'], len(battles), start_time, now))
-
-        rounds = round_number - 1
-
-        next_round_pretenders = []
-
-        if tournament['pretenders']:
-            pretenders = [i['tag'] for i in tournament['pretenders']]
-            next_round_pretenders = tournament['pretenders']
-        elif battles:
-            pretenders = []
-            for battle in battles:
-                first_competitor = battle['first_competitor']
-                second_competitor = battle['second_competitor']
-                pretenders.append(first_competitor['tag'])
-
-                if battle['is_fake']:
-                    next_round_pretenders.append(first_competitor)
-                else:
-                    pretenders.append(battle['second_competitor']['tag'])
-
-                    winner_id = battle['winner_id']
-                    if winner_id:
-                        next_round_pretenders.append(
-                            first_competitor if winner_id == first_competitor['id'] else second_competitor
-                        )
-        else:
-            pretenders = []
-
-        log.debug('%-20s | owner : %5s | pretenders : %s', tournament['province_id'], owner, pretenders)
-        if pretenders:
-            rounds += math.ceil(math.log2(len(pretenders)))
-
-        if owner in pretenders:
-            rounds -= 1
-
-        times = [{
-            'winner_id': None,
-            'is_fake': False,
-            'title': 'Final' if (i + 1 == rounds) else f'1/{pow(2, rounds-i-1)}',
-            'time': int((start_time + timedelta(minutes=30)*i).timestamp() * 1000),
-            'duration': 1800000,
-            'clan_a': None,
-            'clan_b': None,
-            'pretenders': next_round_pretenders if i + 1 == next_round and next_round_pretenders else None
-        } for i in range(rounds)]
-
-        next_round_pretenders.sort(key=lambda x: x['elo_rating_10'])
-
-        # special case
-        owner_battle = {
-            'winner_id': None,
-            'title': 'Owner',
-            'time': int((start_time + timedelta(minutes=30) * len(times)).timestamp() * 1000),
-            'duration': 1800000,
-            'clan_a': tournament['owner'],
-            'clan_b': None,
-        }
-
-        if owner and pretenders:
-            times.append(owner_battle)
-
-        for battle in battles:
-            first_competitor = battle['first_competitor']
-            second_competitor = battle['second_competitor']
-
-            province_round = times[round_number - 1]
-
-            if battle['is_fake']:
-                if first_competitor['tag'] == clan.clan_tag:
-                    province_round.update({
-                        'is_fake': True,
-                        'winner_id': battle['winner_id'],
-                    })
-            elif first_competitor['tag'] == clan.clan_tag or second_competitor['tag'] == clan.clan_tag:
-                province_round.update({
-                    'winner_id': battle['winner_id'],
-                    'clan_a': battle['first_competitor'],
-                    'clan_b': battle['second_competitor'],
-                })
-
-        # filter out already passed rounds
-        if times:
-            # remove rounds before current round
-            times = times[round_number - 1:]
-
-            # if winner already determined for current round
-            if times[0]['winner_id']:
-                times = times[1:]
-
-        if times:
-            if owner == clan.clan_tag:
-                times = [owner_battle]
-
-            all_battles.append({
-                'id': tournament['province_id'],
-                'region': region,
-                'front_name': await get_front_name(region, tournament['front_id'], fronts),
-                'province_name': tournament['province_name'],
-                'arena_name': tournament['arena_name'],
-                'start_time': int(start_time.timestamp() * 1000),
-                'prime_time': str(start_time.time()),
-                'times': times,
-                'pretenders': pretenders,
-            })
-
-    all_battles.sort(key=lambda x: (x['times'][0]['time'], x['start_time'], x['id']))
+    try:
+        all_battles.sort(key=lambda x: (x['times'][0]['time'], x['start_time'], x['id']))
+    except:
+        now = datetime.now().isoformat()
+        filename = f'errors/province/{now}_{province_id}_sort_all_battles'
+        with open(f'{filename}.json', 'w', encoding='utf-8') as f:
+            f.write(json.dumps(all_battles, indent=4))
+        with open(f'{filename}.traceback', 'w', encoding='utf-8') as f:
+            f.write(traceback.format_exc())
+        log.error("Unable to sort")
 
     return all_battles
 
@@ -411,4 +439,10 @@ def main():
 
 
 if __name__ == '__main__':
+    if not os.path.exists('errors'):
+        os.mkdir('errors')
+    if not os.path.exists('errors/province'):
+        os.mkdir('errors/province')
+    if not os.path.exists('errors/other'):
+        os.mkdir('errors/other')
     main()
