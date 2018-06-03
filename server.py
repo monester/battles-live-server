@@ -159,7 +159,7 @@ async def get_clan_provinces(region, clan):
         front_provinces[k] = list(set(v))
 
     log.debug('Got %s provinces for %s: %s', len(provinces), clan.clan_tag, provinces)
-    return provinces, front_provinces
+    return provinces, front_provinces, clan_provinces
 
 
 async def get_front_name(region, front_id, fronts):
@@ -323,7 +323,6 @@ async def parse_tournament(region, tournament, clan, fronts):
 @timeit
 async def get_clan_battles(region, provinces, clan):
     tournaments = await asyncio.gather(*[get_tournament_info(region, p) for p in provinces])
-    all_battles = []
 
     with orm.db_session:
         fronts = {f.front_id: f.front_name for f in orm.select(f for f in Front)}
@@ -399,7 +398,7 @@ async def list_battles(request):
     data = {}
 
     if clan:
-        all_provinces, front_provinces = await get_clan_provinces(region, clan)
+        all_provinces, front_provinces, clan_provinces = await get_clan_provinces(region, clan)
         provinces = await get_provinces_data(region, front_provinces)
         battles = await get_clan_battles(region, all_provinces, clan)
 
@@ -413,7 +412,7 @@ async def list_battles(request):
                 else:
                     battle['tags'] = []
 
-        data = {'tag': tag, 'clan_id': clan.clan_id, 'items': battles}
+        data = {'tag': tag, 'clan_id': clan.clan_id, 'items': battles, 'clan_provinces': clan_provinces}
         # print(json.dumps(battles, indent=4))
 
     return web.Response(
