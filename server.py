@@ -154,7 +154,7 @@ async def get_clan_provinces(region, clan):
     ]
     provinces = await asyncio.gather(*tasks)
     clan_battles = provinces[0]
-    clan_provinces = provinces[1]['data'][str(clan.clan_id)]
+    clan_provinces = provinces[1]['data'][str(clan.clan_id)] or []
 
     provinces = []
     front_provinces = {}
