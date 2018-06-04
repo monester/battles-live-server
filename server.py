@@ -112,6 +112,23 @@ async def get_papi_provinces(region, front_id, provinces):
             return data['data']
 
 
+@timeit
+async def get_papi_eventclaninfo(region, clan_id, event_id='arms_race', front_id='arms_race_bg'):
+    params = {
+        'application_id': WARGAMING_API,
+        'event_id': event_id,
+        'front_id': front_id,
+        'clan_id': clan_id,
+    }
+    url = get_papi_url(region, 'wot/globalmap/eventclaninfo')
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params) as resp:
+            data = await resp.json()
+            data = data['data'][str(clan_id)]['events'][event_id][0]
+            data['clan_id'] = clan_id
+            return data
+
+
 async def get_tournament_info(region, province_id, round_number=None):
     url = f'https://{region}.wargaming.net/globalmap/game_api/tournament_info?'
     params = {
@@ -355,6 +372,29 @@ async def get_clan_battles(region, provinces, clan):
             f.write(traceback.format_exc())
         log.error("Unable to sort")
 
+    # collect clans needed extra data
+    need_clan_event_info = set()
+    for battle in all_battles:
+        next_battle = battle['times'][0]
+        if next_battle['clan_a']:
+            need_clan_event_info.add(next_battle['clan_a']['id'])
+        if next_battle['clan_b']:
+            need_clan_event_info.add(next_battle['clan_b']['id'])
+
+    clan_info = {}
+    for data in await asyncio.gather(*[get_papi_eventclaninfo(region, i) for i in need_clan_event_info]):
+        clan_info[data['clan_id']] = data
+
+    # append clan info to battles
+    for battle in all_battles:
+        next_battle = battle['times'][0]
+        if next_battle['clan_a']:
+            clan_id = next_battle['clan_a']['id']
+            next_battle['clan_a']['fame_points'] = clan_info[clan_id]['fame_points']
+        if next_battle['clan_b']:
+            clan_id = next_battle['clan_b']['id']
+            next_battle['clan_b']['fame_points'] = clan_info[clan_id]['fame_points']
+
     return all_battles
 
 
@@ -398,8 +438,13 @@ async def list_battles(request):
     data = {}
 
     if clan:
+        # get provinces list on which clan can have battles
         all_provinces, front_provinces, clan_provinces = await get_clan_provinces(region, clan)
+
+        # get provinces extra data from cache or papi -> server
         provinces = await get_provinces_data(region, front_provinces)
+
+        # get battles info from game_api/tournament_info
         battles = await get_clan_battles(region, all_provinces, clan)
 
         with orm.db_session:
