@@ -8,6 +8,7 @@ name = "pypi"
 [packages]
 aiohttp = "*"
 pytz = "*"
+aiohttp-session = {extras = ["aioredis"]}
 
 [requires]
 python_version = "3.6"
