@@ -17,6 +17,7 @@ from aiohttp_session.redis_storage import RedisStorage
 import json
 from pony import orm
 from db import Clan, Province, Front, ProvinceTag
+from wgpapi import PAPI
 
 from timeit import timeit
 
@@ -27,15 +28,6 @@ log = logging.getLogger('wot-proxy-server')
 log.setLevel(logging.DEBUG)
 
 
-def get_papi_url(region, path):
-    if region == 'na':
-        url = f'https://api.worldoftanks.com/{path}/'
-    else:
-        url = f'https://api.worldoftanks.{region}/{path}/'
-    log.debug('URL generated: "%s"', url)
-    return url
-
-
 async def get_clan_info(region, tag):
     tag = tag.upper()
 
@@ -44,34 +36,20 @@ async def get_clan_info(region, tag):
     if len(clans):
         return clans[0]
 
-    params = {
-        'application_id': WARGAMING_API,
-        'search': tag,
-    }
-    async with aiohttp.ClientSession() as session:
-        url = get_papi_url(region, 'wgn/clans/list')
-        async with session.get(url, params=params) as resp:
-            data = await resp.json()
-            for clan in data['data']:
-                if clan['tag'] == tag:
-                    with orm.db_session:
-                        clan = Clan(clan_id=str(clan['clan_id']), clan_tag=clan['tag'], region=region)
-                    return clan
-            return None
+    papi = PAPI(region=region, application_id=WARGAMING_API)
+    for clan in await papi('wgn/clans/list', params={'search': tag}):
+        if clan['tag'] == tag:
+            with orm.db_session:
+                clan = Clan(clan_id=str(clan['clan_id']), clan_tag=clan['tag'], region=region)
+            return clan
+    return None
 
 
 class ClanBattles:
     def __init__(self, region: str, clan: Clan):
         self.region = region
         self.clan = clan
-
-    def get_papi_url(self, path):
-        if self.region == 'na':
-            url = f'https://api.worldoftanks.com/{path}/'
-        else:
-            url = f'https://api.worldoftanks.{self.region}/{path}/'
-        log.debug('URL generated: "%s"', url)
-        return url
+        self.papi = PAPI(region=region, application_id=WARGAMING_API)
 
     def get_game_api_url(self, path):
         url = f'https://{self.region}.wargaming.net/globalmap/game_api/{path}'
@@ -92,61 +70,35 @@ class ClanBattles:
     @timeit
     async def get_papi_clan_provinces(self):
         params = {
-            'application_id': WARGAMING_API,
             'clan_id': self.clan.clan_id,
         }
-        url = self.get_papi_url('wot/globalmap/clanprovinces')
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                data = await resp.json()
-                return data
-
-    @timeit
-    async def get_papi_fronts(self):
-        params = {
-            'application_id': WARGAMING_API,
-        }
-        url = self.get_papi_url('wot/globalmap/fronts')
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                data = await resp.json()
-                return data
-
+        return await self.papi('wot/globalmap/clanprovinces', params=params)
 
     @timeit
     async def get_papi_provinces(self, front_id, provinces):
         params = {
-            'application_id': WARGAMING_API,
             'front_id': front_id,
             'province_id': ','.join(provinces),
             'fields': ','.join(['province_id', 'province_name', 'server', 'front_id'])
         }
-        url = self.get_papi_url('wot/globalmap/provinces')
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                data = await resp.json()
-                return data['data']
+        return await self.papi('wot/globalmap/provinces', params=params)
 
 
     @timeit
     async def get_papi_eventclaninfo(self, clan_id, event_id='arms_race', front_id='arms_race_bg'):
         params = {
-            'application_id': WARGAMING_API,
             'event_id': event_id,
             'front_id': front_id,
             'clan_id': clan_id,
         }
-        url = self.get_papi_url('wot/globalmap/eventclaninfo')
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                try:
-                    data = await resp.json()
-                    data = data['data'][str(clan_id)]['events'][event_id][0]
-                    data['clan_id'] = clan_id
-                    return data
-                except:
-                    return {clan_id: {}}
+        try:
+            data = await self.papi('wot/globalmap/eventclaninfo', params=params)
+            data = data[str(clan_id)]['events'][event_id][0]
+            data['clan_id'] = clan_id
+            return data
+        except:
+            return {clan_id: {}}
 
     async def get_tournament_info(self, province_id, round_number=None):
         url = f'https://{self.region}.wargaming.net/globalmap/game_api/tournament_info'
@@ -173,7 +125,7 @@ class ClanBattles:
         ]
         provinces = await asyncio.gather(*tasks)
         clan_battles = provinces[0]
-        clan_provinces = provinces[1]['data'][str(self.clan.clan_id)] or []
+        clan_provinces = provinces[1][str(self.clan.clan_id)] or []
 
         provinces = []
         front_provinces = {}
@@ -201,7 +153,7 @@ class ClanBattles:
     async def get_front_name(self, front_id, fronts):
         if front_id not in fronts:
             with orm.db_session:
-                for front in (await self.get_papi_fronts())['data']:
+                for front in await self.papi('wot/globalmap/fronts'):
                     if front['front_id'] not in fronts:
                         Front(front_id=front['front_id'], front_name=front['front_name'])
                         fronts[front['front_id']] = front['front_name']
