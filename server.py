@@ -474,6 +474,10 @@ async def set_tags(request):
     )
 
 
+async def status(request):
+    return web.Response(text='OK', content_type='application/text')
+
+
 async def make_redis_pool():
     redis_address = ('127.0.0.1', '6379')
     return await aioredis.create_redis_pool(redis_address, timeout=1)
@@ -494,6 +498,7 @@ def main():
 
     app.router.add_post('/tags/{region}/{clan_id}/{province_id}', set_tags)
     app.router.add_get('/{region}/{tag}', list_battles)
+    app.router.add_get('/status', status)
     web.run_app(app)
 
 
