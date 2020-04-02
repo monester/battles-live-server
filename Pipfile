@@ -9,6 +9,7 @@ name = "pypi"
 aiohttp = "*"
 pytz = "*"
 aiohttp-session = {extras = ["aioredis"]}
+pony = "*"
 
 [requires]
-python_version = "3.7"
+python_version = "3.8"

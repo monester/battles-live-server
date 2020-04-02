@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import traceback
 from itertools import chain
 import math
